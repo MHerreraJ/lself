@@ -1,0 +1,52 @@
+#!/bin/bash
+#
+# File:    _%EXECUTABLE%_completion.bash
+# Author:  Manuel Herrera Juarez
+# Date:    2026-03-24
+# License: GNU General Public License v3.0 (GPLv3)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+#
+
+_%EXECUTABLE%_completion(){
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    opts_short="-h -l -a -t -s -T -R -d -I -L -P"
+    opts_long="--help --lib --arch --type --strict --test --recursive --depth --ignore --ignore-list --list --full-path --no-color"
+
+    if [[ ${prev} == --arch || ${prev} == -a ]]; then
+        MACHINES="none m32 sparc i386 x86 m68k m88k intel mcu i860 mips s/370 mips le pa-risc vpp500 sparc32+ i960 powerpc powerpc64 s390x spu v800 fr20 rh32 rce arm arm32 alpha superh sparc v9 tricore arc h8/300 h8/300h h8s h8/500 itanium mips x coldfire 68hc12 mma pcp ncpu ndr1 starcore me16 st100 tinyj x86-64 x86_64 amd64 pdsp pdp-10 pdp-11 fx66 st9+ st7 68hc16 68hc11 68hc08 68hc05 svx st19 vax cris javelin firepath zsp mmix huany prism avr fr30 d10v d30v v850 m32r mn10300 mn10200 picojava openrisc arc compact xtensa videocore tmm gpp ns32k tpc snp1k st200 ip2k max cr f2mc16 msp430 blackfin  aarch64 arm64 riscv"
+        COMPREPLY=( $(compgen -W "${MACHINES}" -- ${cur}) )
+        return 0
+    fi
+
+    if [[ ${prev} == --type || ${prev} == -t ]]; then
+        FILE_TYPES="r rel relocatable e exec executable d dyn dynamic s shared c core a all"
+        COMPREPLY=( $(compgen -W "${FILE_TYPES}" -- ${cur}) )
+        return 0
+    fi
+
+
+    if [[ ${cur} == --* ]]; then
+        COMPREPLY=( $(compgen -W "${opts_long}" -- ${cur}) )
+    elif [[ ${cur} == -* ]]; then
+        COMPREPLY=( $(compgen -W "${opts_short}" -- ${cur}) )
+    else
+        COMPREPLY=()
+    fi
+}
+
+complete -o default -o nosort -F _%EXECUTABLE%_completion %EXECUTABLE%

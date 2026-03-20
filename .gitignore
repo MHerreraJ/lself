@@ -1,0 +1,6 @@
+/.vscode
+*.o
+/lself
+/lself_completion.bash
+/libelfctx.a
+ 
