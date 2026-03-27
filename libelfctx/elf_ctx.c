@@ -26,6 +26,23 @@
 #include <stdlib.h>
 #include "elf_ctx.h"
 
+#ifndef EM_ARCV2
+#define EM_ARCV2 195
+#endif
+
+#ifndef EM_INTELGT
+#define EM_INTELGT 205
+#endif
+
+#ifndef EM_CSKY
+#define EM_CSKY 252
+#endif
+
+#ifndef EM_LOONGARCH
+#define EM_LOONGARCH 258
+#endif
+
+
 static void __ehdr32_to_ehdr64(Elf32_Ehdr* ehdr32, Elf64_Ehdr* ehdr64) {
     memset(ehdr64, 0, sizeof(Elf64_Ehdr));
     memcpy(ehdr64->e_ident, ehdr32->e_ident, EI_NIDENT);
