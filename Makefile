@@ -2,8 +2,15 @@ CFLAGS=-Wall -Wextra -pedantic -O3 -Ilibelfctx
 LDFLAGS=
 
 EXECUTABLE?=lself
-LIBELFCTX?=libelfctx.a
+USE_SHARED_LIBS?=0
 
+ifeq ($(USE_SHARED_LIBS),1)
+LIBELFCTX=libelfctx.so
+LDFLAGS += -L. -lelfctx
+else
+LIBELFCTX=libelfctx.a
+LDFLAGS += libelfctx.a
+endif
 AUTOCOMPLETION_SCRIPT=$(EXECUTABLE)_completion.bash
 AUTOCOMPLETION_SCRIPT_IN=completion.bash.in
 
@@ -22,6 +29,9 @@ all: $(EXECUTABLE) $(AUTOCOMPLETION_SCRIPT)
 
 install: all
 	@echo "INSTALLING..."
+ifeq ($(USE_SHARED_LIBS),1)
+	$(Q)$(INSTALL) -v -Dm755 $(LIBELFCTX) $(PREFIX)/lib/$(LIBELFCTX)
+endif
 	$(Q)$(INSTALL) -v -Dm755 $(EXECUTABLE) $(PREFIX)/bin/$(EXECUTABLE)
 	$(Q)$(INSTALL) -v -Dm755 $(AUTOCOMPLETION_SCRIPT) $(PREFIX)/share/bash-completion/completions/$(EXECUTABLE)
 
@@ -34,12 +44,15 @@ $(AUTOCOMPLETION_SCRIPT): $(AUTOCOMPLETION_SCRIPT_IN)
 $(LIBELFCTX): libelfctx/*.c libelfctx/*.h
 	@echo "BUILDING $@"
 	$(Q)$(CC) $(CFLAGS) -c libelfctx/*.c -o libelfctx/libelfctx.o
-	$(Q)ar rcs $@ libelfctx/*.o
-	
+ifeq ($(USE_SHARED_LIBS),1)
+	$(Q)$(CC) -shared -o $@ libelfctx/*.o
+else
+	$(Q)$(AR) rcs $@ libelfctx/*.o
+endif	
 
 $(EXECUTABLE): lself.c $(LIBELFCTX)
 	@echo "LINK $@"
-	$(Q)$(CC) $(CFLAGS) lself.c -o $@ $(LDFLAGS) $(LIBELFCTX)
+	$(Q)$(CC) $(CFLAGS) lself.c -o $@ $(LDFLAGS)
 
 clean:
 	$(Q)rm -v -f $(EXECUTABLE) $(AUTOCOMPLETION_SCRIPT) libelfctx/*.o $(LIBELFCTX)
