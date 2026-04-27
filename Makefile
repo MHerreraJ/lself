@@ -1,4 +1,11 @@
-CFLAGS=-Wall -Wextra -pedantic -O3 -Ilibelfctx
+RELEASE?=1
+ifeq ($(RELEASE),1)
+CFLAGS= -O3
+else
+CFLAGS= -Og -g
+endif
+
+CFLAGS+=-Wall -Wextra -pedantic -O3 -Ilibelfctx
 LDFLAGS=
 
 EXECUTABLE?=lself

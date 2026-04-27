@@ -378,6 +378,10 @@ const Elf64_Dyn* elf_ctx_get_dynamic_section(elf_ctx* ctx)
         return NULL;
     }
 
+    if(dynPhdr->p_filesz == 0){
+        return NULL;
+    }
+
     maxDynEntries = dynPhdr->p_filesz / (is32bit ? sizeof(Elf32_Dyn) : sizeof(Elf64_Dyn));
     dynEntries = (Elf64_Dyn*)calloc(maxDynEntries+1, sizeof(Elf64_Dyn));
     if(!dynEntries) {
