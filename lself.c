@@ -39,6 +39,7 @@
 #define PATH_MAX 4096
 #endif
 
+#define PROGRAM_VERSION "1.0.0"
 
 DECLARE_DYNARR(char*, str_array, free, ,strdup)
 DECLARE_DYNARR(int, int_array, (void), ,(int))
@@ -54,11 +55,13 @@ typedef struct{
     str_array filter_libs;
 
     int testMode;
+    int verbose;
     
     int recursive;
     int depth;
 
     int asList;
+    int prettyFormat;
     int printFullPath;
     int printOnePerLine;
     int colorize;
@@ -70,6 +73,17 @@ typedef struct{
     // and treat ET_DYN as matching both ET_DYN and ET_EXEC.
     int strictType; 
 }lsdelf_ctx;
+
+void lsdelf_ctx_free(lsdelf_ctx* ctx)
+{
+    if(!ctx) return;
+    release_str_array(&ctx->input_paths);
+    release_str_array(&ctx->ignore_patterns);
+    release_str_array(&ctx->ignore_extension_patterns);
+    release_int_array(&ctx->filter_archs);
+    release_int_array(&ctx->filter_types);
+    release_str_array(&ctx->filter_libs);
+}
 
 // Helper function to extract filename from a path
 const char* get_filename(const char* path)
@@ -296,6 +310,60 @@ int add_path_to_list(const char* item, size_t itemSize, void* _ctx)
     return 0;
 }
 
+int add_ignore_pattern(const char* item, size_t itemSize, void* _ctx)
+{
+    lsdelf_ctx* ctx = NULL;
+    if(!_ctx || !item || itemSize == 0) return -1;
+    ctx = (lsdelf_ctx*)_ctx;
+    char* pattern = NULL;
+
+    // Trim leading and trailing whitespace
+    while(itemSize > 0 && (item[0] == ' ' || item[0] == '\t')){
+        item++;
+        itemSize--;
+    }
+    while(itemSize > 0 && (item[itemSize - 1] == ' ' || item[itemSize - 1] == '\t')){
+        itemSize--;
+    }
+
+    //Check if item is inside quotes and remove them
+    if(itemSize > 1 && ((item[0] == '"' && item[itemSize - 1] == '"') || (item[0] == '\'' && item[itemSize - 1] == '\''))){
+        item++;
+        itemSize -= 2;
+    }
+
+    if(itemSize == 0) return 0; // Empty pattern after trimming, ignore
+
+    //Check if is an extension pattern (wildcard starting with '*.')
+    if(itemSize > 2 && item[0] == '*' && item[1] == '.'){
+        //Check if no other wildcards are present
+        int hasOtherWildcards = 0;
+        for(size_t i = 2; i < itemSize; i++){
+            if(item[i] == '*'){
+                hasOtherWildcards = 1;
+                break;
+            }
+        }
+        if(!hasOtherWildcards){
+            // Add to ignore_extension_patterns without the leading '*'
+            pattern = (char*)calloc(1,itemSize); // itemSize - 1 for leading '*' + 1 for null terminator
+            if(!pattern) return -1;
+            memcpy(pattern, item + 1, itemSize - 1);
+
+            add_str_array_item(&ctx->ignore_extension_patterns, pattern);
+            return 0;
+        }
+    }
+
+    pattern =(char*)malloc(itemSize + 1);
+    if(!pattern) return -1;
+    memcpy(pattern, item, itemSize);
+    pattern[itemSize] = '\0';
+    add_str_array_item_move(&ctx->ignore_patterns, pattern);
+
+    return 0;
+}
+
 void printUsage(const char* progName)
 {
     fprintf(stderr, "Usage: %s [options] <input paths...>\n", progName);
@@ -317,39 +385,76 @@ void printUsage(const char* progName)
     fprintf(stderr, "  -R, --recursive          Recursively search directories for ELF files\n");
     fprintf(stderr, "  -d, --depth <n>          Set the recursion depth (default is 1)\n");
     fprintf(stderr, "  -I, --ignore <pattern>   Ignore files matching the pattern\n");
-    fprintf(stderr, "      --ignore-list        Provide a file with ignore patterns\n");
     fprintf(stderr, "                           (one pattern per line, supports wildcards)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  -L, --list               Print in list format\n");
     fprintf(stderr, "  -P, --full-path          Print full path instead of just filename\n");
+    fprintf(stderr, "  -F, --pretty             Pretty format (only applies with --list)\n");
     fprintf(stderr, "  --no-color               Disable colorized output\n");
     fprintf(stderr, "  -1                       Print only the filename (no path)\n");
     fprintf(stderr, "\n");
+    fprintf(stderr, "  -v, --verbose            Enable verbose output\n");
+    fprintf(stderr, "  --config <file>          Use specified config file\n");
+    fprintf(stderr, "  --no-config              Don't load configuration from ~/.lselfrc\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  --version                Show version information\n");
     fprintf(stderr, "  -h, --help               Show this help message\n");
 }
 
-int parseIgnoreFileList(lsdelf_ctx* ctx, const char* path)
+int parseBoolValue(const char* str, int* outValue)
 {
-    struct stat st;
-    if(stat(path, &st) != 0){
-        fprintf(stderr, "Failed to stat ignore list file '%s': %s\n", path, strerror(errno));
-        return -1;
+    if(strcmp(str, "1") == 0 || strcasecmp(str, "true") == 0 || strcasecmp(str, "yes") == 0 || strcasecmp(str, "on") == 0 || strcasecmp(str, "y") == 0){
+        *outValue = 1;
+        return 0;
+    }else if(strcmp(str, "0") == 0 || strcasecmp(str, "false") == 0 || strcasecmp(str, "no") == 0 || strcasecmp(str, "off") == 0 || strcasecmp(str, "n") == 0){
+        *outValue = 0;
+        return 0;
     }
-    if(!S_ISREG(st.st_mode)){
-        fprintf(stderr, "Ignore list file '%s' is not a regular file\n", path);
-        return -1;
+    return -1; // Invalid boolean value
+}
+
+#define DEFAULT_CONFIG_FILE ".lselfrc"
+int loadConfig(lsdelf_ctx* ctx, const char* configPath)
+{
+    int error =0;
+    struct stat st = {0};
+    if(stat(configPath, &st) != 0){
+        error = errno;
+        switch(error){
+            case ENOENT:
+                return error;
+            case EACCES:
+                fprintf(stderr, "Warning: Unable to read configuration file '%s', check permissions and try again\n", configPath);
+                return error;
+            default:
+                fprintf(stderr, "Warning: Unable to read configuration file '%s', what: %d (%s)\n", configPath, error, strerror(error));
+                return error;
+        }
     }
 
-    FILE* file = fopen(path, "r");
-    if(!file){
-        fprintf(stderr, "Failed to open ignore list file '%s': %s\n", path, strerror(errno));
-        return -1;
+    FILE* configFile = fopen(configPath, "r");
+    if(!configFile){
+        return errno;
     }
+
+    //Read configurations consisting of [property]=[attribute]
+    //Accepted configurations:
+    //recursive=[0|1|true|false|yes|no|on|off|y|n]
+    //depth=[n]; n>=0
+    //list=[0|1|true|false|yes|no|on|off|y|n]
+    //pretty=[0|1|true|false|yes|no|on|off|y|n]
+    //full_path=[0|1|true|false|yes|no|on|off|y|n]
+    //colorize=[0|1|true|false|yes|no|on|off|y|n]
+    //strict=[0|1|true|false|yes|no|on|off|y|n]
+    //oneline=[0|1|true|false|yes|no|on|off|y|n]
+    //exclude=[pattern]; supports wildcards, can be specified multiple times or as a comma-separated list
 
     char* line = NULL;
+    int lineNum = 0;
     size_t len = 0;
     ssize_t read;
-    while((read = getline(&line, &len, file)) != -1){
+    while((read = getline(&line, &len, configFile)) != -1){
+        lineNum++;
         // Remove trailing newline
         if(read > 0 && line[read - 1] == '\n'){
             line[read - 1] = '\0';
@@ -373,48 +478,103 @@ int parseIgnoreFileList(lsdelf_ctx* ctx, const char* path)
             continue;
         }
 
-        //Check if is an extension pattern (wildcard starting with '*.')
-        if(len > 2 && line[0] == '*' && line[1] == '.'){
-            //Check if no other wildcards are present
-            int hasOtherWildcards = 0;
-            for(size_t i = 2; i < len; i++){
-                if(line[i] == '*'){
-                    hasOtherWildcards = 1;
-                    break;
-                }
-            }
-            if(!hasOtherWildcards){
-                // Add to ignore_extension_patterns without the leading '*'
-                add_str_array_item(&ctx->ignore_extension_patterns, &line[1]);
-                free(line);
-                line = NULL;
-                len = 0;
-                continue;
-            }
+        char* equalsSign = strchr(line, '=');
+        if(!equalsSign){
+            fprintf(stderr, "Invalid configuration at line %d '%s' in config file '%s'\n", lineNum, line, configPath);
+            free(line);
+            fclose(configFile);
+            return -1;
+
+            line = NULL;
+            len = 0;
+            continue;
         }
 
-        add_str_array_item_move(&ctx->ignore_patterns, line);
-        line = NULL; // Reset line to be allocated by getline for the next iteration
-        len = 0;
+        *equalsSign = '\0';
+        char* property = line;
+        char* value = equalsSign + 1;
+
+        #define PARSE_BOOL_OR_WARN(_value, _name, _target) \
+            if(parseBoolValue(_value, (_target)) != 0){ \
+                fprintf(stderr, "Invalid value at line %d '%s' for '" _name "' in config file '%s'\n", lineNum, _value, configPath); \
+                free(line); \
+                fclose(configFile); \
+                return -1; \
+            }
+
+        if(strcmp(property, "recursive") == 0){
+            PARSE_BOOL_OR_WARN(value, "recursive", &ctx->recursive);
+            if(ctx->recursive){
+                ctx->depth = 0; // Unlimited depth when recursive is true
+            } else {
+                ctx->depth = 1; // Default depth when not recursive
+            }
+        }else if(strcmp(property, "depth") == 0){
+            char* endPtr = NULL;
+            long depth = strtol(value, &endPtr, 10);
+            if(endPtr == value || *endPtr != '\0' || depth < 0){
+                fprintf(stderr, "Invalid value at line %d '%s' for 'depth' in config file '%s'\n", lineNum, value, configPath);
+                free(line);
+                fclose(configFile);
+                return -1;
+            }
+            ctx->depth = (int)depth;
+        }else if(strcmp(property, "list") == 0){
+            PARSE_BOOL_OR_WARN(value, "list", &ctx->asList);
+        } else if (strcmp(property, "pretty") == 0){
+            PARSE_BOOL_OR_WARN(value, "pretty", &ctx->prettyFormat);
+        }else if(strcmp(property, "full_path") == 0){
+            PARSE_BOOL_OR_WARN(value, "full_path", &ctx->printFullPath);
+        }else if(strcmp(property, "colorize") == 0){
+            PARSE_BOOL_OR_WARN(value, "colorize", &ctx->colorize);
+        } else  if(strcmp(property, "strict") == 0){
+            PARSE_BOOL_OR_WARN(value, "strict", &ctx->strictType);
+        }else if(strcmp(property, "oneline") == 0){
+            PARSE_BOOL_OR_WARN(value, "oneline", &ctx->printOnePerLine);
+        }else if(strcmp(property, "exclude") == 0){
+            // Support comma-separated list of patterns
+            if(0 != parseList(value, ',', add_ignore_pattern, ctx)){
+                fprintf(stderr, "Failed to parse 'exclude' patterns at line %d in config file '%s'\n", lineNum, configPath);
+                free(line);
+                fclose(configFile);
+                return -1;
+            }
+        }else if(strcmp(property, "type") == 0){
+            if(0 != parseList(value, ',', add_type_to_list, ctx)){
+                fprintf(stderr, "Failed to parse 'type' at line %d in config file '%s'\n", lineNum, configPath);
+                free(line);
+                fclose(configFile);
+                return -1;
+            }
+        }else if(strcmp(property, "arch") == 0){
+            if(0 != parseList(value, ',', add_machine_to_list, ctx)){
+                fprintf(stderr, "Failed to parse 'arch' at line %d in config file '%s'\n", lineNum, configPath);
+                free(line);
+                fclose(configFile);
+                return -1;
+            }
+        }
+        else{
+            fprintf(stderr, "Unknown configuration property '%s' in config file '%s'\n", property, configPath);
+            free(line);
+            fclose(configFile);
+            return -1;
+        }
     }
 
-    if(line){
-        free(line);
-    }
-
-    fclose(file);
-
+    if(line) free(line);
+    fclose(configFile);
     return 0;
 }
 
-int parseArgs(lsdelf_ctx* ctx, int argc, char** argv)
+int parseArgs(lsdelf_ctx* ctx, int argc, char** argv, int canReloadConfig)
 {
+    int needsConfigReload = 0;
+    const char* newConfigFile=NULL;
+    int typeSet = 0;
+    int archSet = 0;
+    
     #define OPTIONS(...) (const char*[]) { __VA_ARGS__, NULL }
-    memset(ctx, 0, sizeof(lsdelf_ctx));
-
-    ctx->depth = 1;// Default depth is 1 (non-recursive)
-    ctx->colorize = 1; // Default colorize is on
-
 
     int i = 1;
     while(i < argc){
@@ -426,6 +586,10 @@ int parseArgs(lsdelf_ctx* ctx, int argc, char** argv)
         int skipBy = 0;
 
         if((matchedOpt = matchOption(currentArg, OPTIONS("-a", "--arch")))){
+            if(!archSet){
+                release_int_array(&ctx->filter_archs);
+                archSet = 1;
+            }
             if((skipBy = extractOptionValue(matchedOpt, currentArg, nextArg, &optValue)) >= 0){
                 // Successfully extracted option value
                 if(optValue[0]!='\0'){
@@ -437,6 +601,10 @@ int parseArgs(lsdelf_ctx* ctx, int argc, char** argv)
                 }
             }
         }else if((matchedOpt = matchOption(currentArg, OPTIONS("-t", "--type")))){
+            if(!typeSet){
+                release_int_array(&ctx->filter_types);
+                typeSet = 1;
+            }
             if((skipBy = extractOptionValue(matchedOpt, currentArg, nextArg, &optValue)) >= 0){
                 // Successfully extracted option value
                 if(optValue[0]!='\0'){
@@ -497,6 +665,10 @@ int parseArgs(lsdelf_ctx* ctx, int argc, char** argv)
                     skipBy=-3; // Empty value
                 }
             }
+        } else if((matchedOpt = matchOption(currentArg, OPTIONS("-F", "--pretty")))){
+            if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
+                ctx->prettyFormat = 1;
+            }
         }else if((matchedOpt = matchOption(currentArg, OPTIONS("-L", "--list")))){
             if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
                 ctx->asList = 1;
@@ -508,6 +680,12 @@ int parseArgs(lsdelf_ctx* ctx, int argc, char** argv)
                 ctx->depth = 0; // Unlimited depth
             }
         }
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("-R", "--no-recursive")))){
+            if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
+                ctx->recursive = 0;
+                ctx->depth = 1; // Reset to default depth for non-recursive
+            }
+        }
         else if((matchedOpt = matchOption(currentArg, OPTIONS("-d", "--depth")))){
             skipBy = extractOptionIntValue(matchedOpt, currentArg, nextArg, &ctx->depth);
         }
@@ -516,23 +694,11 @@ int parseArgs(lsdelf_ctx* ctx, int argc, char** argv)
                 ctx->strictType = 1;
             }
         }
-        else if((matchedOpt = matchOption(currentArg, OPTIONS("--ignore-list")))){
-            if((skipBy = extractOptionValue(matchedOpt, currentArg, nextArg, &optValue)) >= 0){
-                // Successfully extracted option value
-                if(optValue[0]!='\0'){
-                    if(0 != parseIgnoreFileList(ctx, optValue)){
-                        return -2; // Do not print help
-                    }
-                }else{
-                    skipBy=-3; // Empty value
-                }
-            }
-        }
         else if((matchedOpt = matchOption(currentArg, OPTIONS("-I", "--ignore")))){
             if((skipBy = extractOptionValue(matchedOpt, currentArg, nextArg, &optValue)) >= 0){
                 // Successfully extracted option value
                 if(optValue[0]!='\0'){
-                    add_str_array_item(&ctx->ignore_patterns, optValue);
+                    add_ignore_pattern(optValue, strlen(optValue), ctx);
                 }else{
                     skipBy=-3; // Empty value
                 }
@@ -562,7 +728,40 @@ int parseArgs(lsdelf_ctx* ctx, int argc, char** argv)
             if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
                 return 1;
             }
-        }else{
+        }else if((matchedOpt = matchOption(currentArg, OPTIONS("-v", "--verbose")))){
+            if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
+                ctx->verbose = 1;
+            }
+        }
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("--version")))){
+            if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
+                printf("lself version: %s\n", PROGRAM_VERSION);
+                printf("Built on: %s %s\n", __DATE__, __TIME__);
+                printf("Written by: Manuel Herrera Juarez\n");
+                return 2;
+            }
+        }
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("--no-config")))){
+            if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
+                needsConfigReload = 1;
+                newConfigFile = NULL;
+            }
+        }
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("--config")))){
+            if((skipBy = extractOptionValue(matchedOpt, currentArg, nextArg, &optValue)) >= 0){
+                // Successfully extracted option value
+                if(optValue == nextArg && optValue[0] == '-'){
+                    // Next argument looks like another option, treat as missing value
+                    skipBy = -2;
+                }else if(optValue[0]!='\0'){
+                    needsConfigReload = 1;
+                    newConfigFile = optValue;
+                }else{
+                    skipBy=-3; // Empty value
+                }
+            }
+        }
+        else{
             if(currentArg[0] == '-'){
                 // Unknown option
                 skipBy = -1;
@@ -589,20 +788,28 @@ int parseArgs(lsdelf_ctx* ctx, int argc, char** argv)
 
         i+= 1 + skipBy;
     }
+
+    if(needsConfigReload && canReloadConfig){
+        //We do this at last to check arguments are valid before reloading config and potentially losing them
+        lsdelf_ctx_free(ctx);
+        memset(ctx, 0, sizeof(lsdelf_ctx));
+        ctx->depth = 1;// Default depth is 1 (non-recursive)
+        ctx->colorize = 1; // Default colorize is on   
+
+        if(newConfigFile){
+            if(0 != loadConfig(ctx, newConfigFile)){
+                fprintf(stderr, "Error loading configuration from '%s'\n", newConfigFile);
+                return -2;
+            }
+        }
+        //Recurse but now with canReloadConfig=0 to avoid infinite recursion
+        return parseArgs(ctx, argc, argv, 0);
+    }
     
     return 0;
 }
 
-void lsdelf_ctx_free(lsdelf_ctx* ctx)
-{
-    if(!ctx) return;
-    release_str_array(&ctx->input_paths);
-    release_str_array(&ctx->ignore_patterns);
-    release_str_array(&ctx->ignore_extension_patterns);
-    release_int_array(&ctx->filter_archs);
-    release_int_array(&ctx->filter_types);
-    release_str_array(&ctx->filter_libs);
-}
+
 
 int lsdelf_filter_arch(lsdelf_ctx* ctx, elf_ctx* elf)
 {
@@ -775,42 +982,71 @@ void printf_elf_info(lsdelf_ctx* ctx, elf_ctx* elf, const char* parentDir, int b
         }
         return;
     }
-
-    printf("%-8s %-8s", type, machine);
-    const Elf64_Dyn* needed = NULL;
-    unsigned int offset = 0;
-    int isFirstLib=1;
-    do{
-        needed = elf_ctx_get_dynamic_section_entry(elf, DT_NEEDED, offset++);
-        if(!needed){    
-            break;
-        }
-        const char* libName = elf_ctx_get_dynamic_entry_str(elf, needed);
-        if(!libName){
-            continue;
-        }
-        if(isFirstLib){
-            printf(" [%s", libName);
-            isFirstLib = 0;
+    
+    if(!ctx->prettyFormat){
+        printf("%-8s %-8s", type, machine);
+        const Elf64_Dyn* needed = NULL;
+        unsigned int offset = 0;
+        int isFirstLib=1;
+        do{
+            needed = elf_ctx_get_dynamic_section_entry(elf, DT_NEEDED, offset++);
+            if(!needed){    
+                break;
+            }
+            const char* libName = elf_ctx_get_dynamic_entry_str(elf, needed);
+            if(!libName){
+                continue;
+            }
+            if(isFirstLib){
+                printf(" [%s", libName);
+                isFirstLib = 0;
+            }else{
+                printf(", %s", libName);
+            }
+        }while(needed);
+        if(!isFirstLib){
+            printf("]");
+            if(isExec && ctx->colorize){
+                printf("    \033[32;1m%s\033[0m\n", filePath);
+            }else{
+                printf("    %s\n", filePath);
+            }
         }else{
-            printf(", %s", libName);
-        }
-    }while(needed);
-    if(!isFirstLib){
-        printf("]");
-        if(isExec && ctx->colorize){
-            printf("    \033[32;1m%s\033[0m\n", filePath);
-        }else{
-            printf("    %s\n", filePath);
+            if(isExec && ctx->colorize){
+                printf(" \033[32;1m%s\033[0m\n", filePath);
+            }else{
+                printf(" %s\n", filePath);
+            }
         }
     }else{
         if(isExec && ctx->colorize){
-            printf(" \033[32;1m%s\033[0m\n", filePath);
+            printf("── \033[32;1m%s\033[0m (%s, %s)\n", filePath, type, machine);
         }else{
-            printf(" %s\n", filePath);
+            printf("── %s (%s, %s)\n", filePath, type, machine);
         }
-    }
-    
+        const Elf64_Dyn* needed = NULL;
+        unsigned int offset = 0;
+        needed = elf_ctx_get_dynamic_section_entry(elf, DT_NEEDED, offset);
+        if(needed){
+            do{
+                const char* libName = elf_ctx_get_dynamic_entry_str(elf, needed);
+                if(!libName){
+                    continue;
+                }
+                offset++;
+                const Elf64_Dyn* nextNeeded = elf_ctx_get_dynamic_section_entry(elf, DT_NEEDED, offset);
+                if(!nextNeeded){
+                     printf("  └─ %s\n", libName);
+                }else{
+                    printf("  ├─ %s\n", libName);
+                }
+                needed = nextNeeded;
+            }while(needed);
+        }
+        if(offset > 0){
+            printf("\n");
+        }
+    }    
 }
 
 void print_elf_info_list(lsdelf_ctx* ctx, const char* dirName, int depth, elf_ctx_array* elfs)
@@ -1029,15 +1265,94 @@ int lsdelf_process_path(lsdelf_ctx* ctx, const char* path)
     return 0;
 }
 
+int printConfiguration(lsdelf_ctx* ctx)
+{
+    if(!ctx) return 0;
+    printf("Current Configuration:\n");
+    printf("  Recursive: %s\n", ctx->recursive ? "Yes" : "No");
+    if(ctx->recursive){
+        printf("  Depth: %d\n", ctx->depth == 0 ? -1 : ctx->depth);
+    }
+    printf("  List Format: %s\n", ctx->asList ? "Yes" : "No");
+    printf("  Pretty Format: %s\n", ctx->prettyFormat ? "Yes" : "No");
+    printf("  Full Path: %s\n", ctx->printFullPath ? "Yes" : "No");
+    printf("  Colorize: %s\n", ctx->colorize ? "Yes" : "No");
+    printf("  Strict Type Matching: %s\n", ctx->strictType ? "Yes" : "No");
+    printf("  One Per Line: %s\n", ctx->printOnePerLine ? "Yes" : "No");
+
+    if(ctx->filter_archs.count > 0){
+        printf("  Filter Architectures: ");
+        for(size_t i = 0; i < ctx->filter_archs.count; i++){
+            printf("%s ", elf_machine_name(ctx->filter_archs.items[i]));
+        }
+        printf("\n");
+    }else{
+        printf("  Filter Architectures: None\n");
+    }
+
+    if(ctx->filter_types.count > 0){
+        printf("  Filter Types: ");
+        for(size_t i = 0; i < ctx->filter_types.count; i++){
+            printf("%s ", elf_type_name(ctx->filter_types.items[i]));
+        }
+        printf("\n");
+    }else{
+        printf("  Filter Types: None\n");
+    }
+
+    if(ctx->filter_libs.count > 0){
+        printf("  Filter Libraries: ");
+        for(size_t i = 0; i < ctx->filter_libs.count; i++){
+            printf("%s ", ctx->filter_libs.items[i]);
+        }
+        printf("\n");
+    }else{
+        printf("  Filter Libraries: None\n");
+    }
+
+    if(ctx->ignore_patterns.count > 0){
+        printf("  Ignore Patterns: ");
+        for(size_t i = 0; i < ctx->ignore_patterns.count; i++){
+            printf("%s ", ctx->ignore_patterns.items[i]);
+        }
+        printf("\n");
+    }else{
+        printf("  Ignore Patterns: None\n");
+    }
+
+    if(ctx->ignore_extension_patterns.count > 0){
+        printf("  Ignore Extension Patterns: ");
+        for(size_t i = 0; i < ctx->ignore_extension_patterns.count; i++){
+            printf("%s ", ctx->ignore_extension_patterns.items[i]);
+        }
+        printf("\n");
+    }else{
+        printf("  Ignore Extension Patterns: None\n");
+    }
+    printf("\n\n");
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     int rc = 0;
     int parseArgsResult = 0;
     lsdelf_ctx ctx = {0};
+    memset(&ctx, 0, sizeof(lsdelf_ctx));
 
-    parseArgsResult = parseArgs(&ctx, argc, argv);
+    ctx.depth = 1;// Default depth is 1 (non-recursive)
+    ctx.colorize = 1; // Default colorize is on   
+
+    char configPath[PATH_MAX+1] = {0};
+    const char* homeDir = getenv("HOME");
+    if(homeDir){
+        snprintf(configPath, sizeof(configPath), "%s/%s", homeDir, DEFAULT_CONFIG_FILE);
+        loadConfig(&ctx, configPath);
+    }
+
+    parseArgsResult = parseArgs(&ctx, argc, argv,1);
     if(parseArgsResult != 0){
         lsdelf_ctx_free(&ctx);
-        if(parseArgsResult != -2){
+        if(parseArgsResult != -2 && parseArgsResult != 2){ // Don't print usage if it's a version request or if the error was related to ignore file parsing
             printUsage(argv[0]);
         }
         return parseArgsResult > 0? 0 : 1;
@@ -1045,6 +1360,10 @@ int main(int argc, char* argv[]) {
 
     if(!isatty(STDOUT_FILENO)){
         ctx.colorize = 0; // Disable color if output is not a terminal
+    }
+
+    if(ctx.verbose){
+        printConfiguration(&ctx);
     }
 
     if(ctx.input_paths.count == 0){
