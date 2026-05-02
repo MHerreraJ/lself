@@ -25,6 +25,9 @@
 #include <stdio.h>
 
 
+#define SHT_AT_OFFSET SHT_HIUSER -1
+
+
 typedef struct{
     FILE* file;
     char* filePath;
@@ -33,8 +36,16 @@ typedef struct{
 
     Elf64_Phdr* phdrs;
     Elf64_Dyn* dyn_entries;
-    char* strtab;
-    size_t strtab_size;
+    char* dyn_strtab;
+    size_t dyn_strtab_size;
+
+    Elf64_Shdr* shdrs;
+
+    Elf64_Sym* symbols;
+    size_t symbols_count;
+
+    char* symbol_strtab;
+    size_t symbol_strtab_size;
 
     int error;
 } elf_ctx;
@@ -61,6 +72,13 @@ int elf_ctx_is_machine(elf_ctx* ctx, int machine);
 const Elf64_Phdr* elf_ctx_get_program_header(elf_ctx* ctx, Elf64_Word type, unsigned int off);
 const Elf64_Dyn* elf_ctx_get_dynamic_section(elf_ctx* ctx);
 const Elf64_Dyn* elf_ctx_get_dynamic_section_entry(elf_ctx* ctx, Elf64_Sxword tag, unsigned int off);
+
+const Elf64_Shdr* elf_ctx_get_section_header(elf_ctx* ctx, Elf64_Word type, unsigned int off);
+// const elf_ctx_strtab* elf_ctx_get_strtab(elf_ctx* ctx, size_t index);
+const Elf64_Sym* elf_ctx_get_symbol(elf_ctx* ctx, size_t index);
+const char* elf_ctx_get_symbol_name(elf_ctx* ctx, const Elf64_Sym* sym);
+
+
 const char* elf_ctx_get_dynamic_section_strtab(elf_ctx* ctx);
 const char* elf_ctx_get_dynamic_entry_str(elf_ctx* ctx, const Elf64_Dyn* entry);
 

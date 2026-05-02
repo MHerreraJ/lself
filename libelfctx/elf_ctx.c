@@ -200,11 +200,28 @@ void elf_ctx_close(elf_ctx* ctx) {
         free(ctx->dyn_entries);
         ctx->dyn_entries = NULL;
     }
-    if(ctx->strtab){
-        free(ctx->strtab);
-        ctx->strtab = NULL;
+    if(ctx->dyn_strtab){
+        free(ctx->dyn_strtab);
+        ctx->dyn_strtab = NULL;
     }
-    ctx->strtab_size = 0;
+    ctx->dyn_strtab_size = 0;
+
+    if(ctx->shdrs){
+        free(ctx->shdrs);
+        ctx->shdrs = NULL;
+    }
+
+    if(ctx->symbols){
+        free(ctx->symbols);
+        ctx->symbols = NULL;
+    }
+    ctx->symbols_count = 0;
+
+    if(ctx->symbol_strtab){
+        free(ctx->symbol_strtab);
+        ctx->symbol_strtab = NULL;
+    }
+    ctx->symbol_strtab_size = 0;
 }
 
 int elf_ctx_get_error(elf_ctx* ctx) {
@@ -454,8 +471,8 @@ const char* elf_ctx_get_dynamic_section_strtab(elf_ctx* ctx)
         return NULL;
     }
 
-    if(ctx->strtab) {
-        return ctx->strtab;
+    if(ctx->dyn_strtab) {
+        return ctx->dyn_strtab;
     }
 
 
@@ -507,9 +524,9 @@ const char* elf_ctx_get_dynamic_section_strtab(elf_ctx* ctx)
         return NULL;
     }
 
-    ctx->strtab = strtab;
-    ctx->strtab_size = strtabSizeEntry->d_un.d_val;
-    return ctx->strtab;
+    ctx->dyn_strtab = strtab;
+    ctx->dyn_strtab_size = strtabSizeEntry->d_un.d_val;
+    return ctx->dyn_strtab;
 }
 
 
@@ -524,7 +541,7 @@ const char* elf_ctx_get_dynamic_entry_str(elf_ctx* ctx, const Elf64_Dyn* entry)
         return NULL;
     }
 
-    if(entry->d_un.d_val >= ctx->strtab_size) {
+    if(entry->d_un.d_val >= ctx->dyn_strtab_size) {
         return NULL;
     }
 
@@ -899,4 +916,124 @@ const char* elf_class_name(int class)
         case ELFCLASS64: return "64-bit";
         default: return "unknown";
     }
+}
+
+const Elf64_Shdr* elf_ctx_get_section_header(elf_ctx* ctx, Elf64_Word type, unsigned int off)
+{
+    if(!elf_ctx_ok(ctx)) {
+        return NULL;
+    }
+
+    if(!ctx->shdrs){
+        if(ctx->ehdr.e_shoff == 0 || ctx->ehdr.e_shnum == 0) return NULL;
+        ctx->shdrs = (Elf64_Shdr*)calloc(ctx->ehdr.e_shnum, sizeof(Elf64_Shdr));
+        if(!ctx->shdrs) {
+            return NULL;
+        }
+        for(unsigned int i = 0; i < ctx->ehdr.e_shnum; i++){
+            if(fseek(ctx->file, ctx->ehdr.e_shoff + i * ctx->ehdr.e_shentsize, SEEK_SET) != 0) {
+                free(ctx->shdrs);
+                ctx->shdrs = NULL;
+                return NULL;
+            }
+            if(fread(&ctx->shdrs[i], 1, sizeof(Elf64_Shdr), ctx->file) != sizeof(Elf64_Shdr)) {
+                free(ctx->shdrs);
+                ctx->shdrs = NULL;
+                return NULL;
+            }
+        }
+    }
+
+    if(type == SHT_AT_OFFSET){
+        if(off >= ctx->ehdr.e_shnum) {
+            return NULL;
+        }
+        return &ctx->shdrs[off];
+    }
+
+    for(unsigned int i = 0; i < ctx->ehdr.e_shnum; i++){
+        if(ctx->shdrs[i].sh_type == type) {
+            if(off == 0) {
+                return &ctx->shdrs[i];
+            }
+            off--;
+        }
+    }
+    return NULL;
+}
+
+const Elf64_Sym* elf_ctx_get_symbol(elf_ctx* ctx, size_t index)
+{
+    if(!elf_ctx_ok(ctx)) {
+        return NULL;
+    }
+
+    if(!ctx->symbols){
+        const Elf64_Shdr* symTableHdr = elf_ctx_get_section_header(ctx, SHT_SYMTAB, 0);
+        if(!symTableHdr) {
+            return NULL;
+        }
+
+        size_t symCount = symTableHdr->sh_size / symTableHdr->sh_entsize;
+        ctx->symbols = (Elf64_Sym*)calloc(symCount, sizeof(Elf64_Sym));
+        
+        for(size_t j = 0; j < symCount; j++){
+            if(fseek(ctx->file, symTableHdr->sh_offset + j * symTableHdr->sh_entsize, SEEK_SET) != 0) {
+                free(ctx->symbols);
+                ctx->symbols = NULL;
+                return NULL;
+            }
+            if(fread(&ctx->symbols[ctx->symbols_count + j], 1, sizeof(Elf64_Sym), ctx->file) != sizeof(Elf64_Sym)) {
+                free(ctx->symbols);
+                ctx->symbols = NULL;
+                return NULL;
+            }            
+        }
+        ctx->symbols_count = symCount;
+    }
+
+    if(index < ctx->symbols_count) {
+        return &ctx->symbols[index];
+    }
+    return NULL;
+}
+
+const char* elf_ctx_get_symbol_name(elf_ctx* ctx, const Elf64_Sym* sym)
+{
+    if(!elf_ctx_ok(ctx) || !sym) {
+        return NULL;
+    }
+
+    if(!ctx->symbol_strtab){
+        const Elf64_Shdr* symTableHdr = elf_ctx_get_section_header(ctx, SHT_SYMTAB, 0);
+        if(!symTableHdr) {
+            return NULL;
+        }
+
+        const Elf64_Shdr* strTabHdr = elf_ctx_get_section_header(ctx, SHT_AT_OFFSET, symTableHdr->sh_link);
+        if(!strTabHdr) {
+            return NULL;
+        }
+
+        if(fseek(ctx->file, strTabHdr->sh_offset, SEEK_SET) != 0) {
+            return NULL;
+        }
+
+        ctx->symbol_strtab_size = strTabHdr->sh_size;
+        ctx->symbol_strtab = (char*)malloc(ctx->symbol_strtab_size);
+        if(!ctx->symbol_strtab) {
+            return NULL;
+        }
+        if(fread(ctx->symbol_strtab, 1, ctx->symbol_strtab_size, ctx->file) != ctx->symbol_strtab_size) {
+            free(ctx->symbol_strtab);
+            ctx->symbol_strtab = NULL;
+            ctx->symbol_strtab_size = 0;
+            return NULL;
+        }   
+    }
+
+    if(sym->st_name < ctx->symbol_strtab_size) {
+        return &ctx->symbol_strtab[sym->st_name];
+    }
+    return NULL;
 }
