@@ -46,6 +46,23 @@ DECLARE_DYNARR(int, int_array, (void), ,(int))
 
 DECLARE_DYNARR_NOCOPY(elf_ctx, elf_ctx_array, elf_ctx_close, &)
 
+
+typedef struct{
+    char* name;
+    int type; // If type<0, match any type
+}elf_symbol;
+
+void elf_symbol_deinit(elf_symbol* sym)
+{
+    if(sym->name){
+        free(sym->name);
+        sym->name = NULL;
+    }
+    sym->type = 0;
+}
+
+DECLARE_DYNARR(elf_symbol, elf_symbol_array, elf_symbol_deinit, & ,)
+
 typedef struct{
     str_array input_paths;
     str_array ignore_patterns;
@@ -53,6 +70,7 @@ typedef struct{
     int_array filter_archs;
     int_array filter_types;
     str_array filter_libs;
+    elf_symbol_array filter_symbols;
 
     int testMode;
     int verbose;
@@ -63,8 +81,14 @@ typedef struct{
     int asList;
     int prettyFormat;
     int printFullPath;
+    int printRealPath;
     int printOnePerLine;
     int colorize;
+    
+    int showArch;
+    int showType;
+    int showLibs;
+    int showSymbols;
 
     int processedPathCount;
 
@@ -73,6 +97,15 @@ typedef struct{
     // and treat ET_DYN as matching both ET_DYN and ET_EXEC.
     int strictType; 
 }lsdelf_ctx;
+
+void lsdelf_ctx_init(lsdelf_ctx* ctx){
+    memset(ctx, 0, sizeof(lsdelf_ctx));
+    ctx->depth = 1;// Default depth is 1 (non-recursive)
+    ctx->colorize = 1; // Default colorize is on
+    ctx->showArch = 1; // Show architecture by default
+    ctx->showType = 1; // Show type by default
+    ctx->showLibs = 1; // Show linked libraries by default
+}
 
 void lsdelf_ctx_free(lsdelf_ctx* ctx)
 {
@@ -83,6 +116,7 @@ void lsdelf_ctx_free(lsdelf_ctx* ctx)
     release_int_array(&ctx->filter_archs);
     release_int_array(&ctx->filter_types);
     release_str_array(&ctx->filter_libs);
+    release_elf_symbol_array(&ctx->filter_symbols);
 }
 
 // Helper function to extract filename from a path
@@ -122,6 +156,15 @@ int str_wildcard_match(const char* pattern, const char* str)
     while(*pattern == '*') pattern++;
 
     return *pattern == '\0' && *str == '\0';
+}
+
+int is_path(const char* path)
+{
+    struct stat pathStat;
+    if(stat(path, &pathStat) != 0){
+        return 0; // Treat errors as not a file
+    }
+    return S_ISREG(pathStat.st_mode) || S_ISLNK(pathStat.st_mode) || S_ISDIR(pathStat.st_mode);
 }
 
 const char* matchOption(const char* arg, const char** options)
@@ -364,6 +407,60 @@ int add_ignore_pattern(const char* item, size_t itemSize, void* _ctx)
     return 0;
 }
 
+int add_symbol_to_list(const char* item, size_t itemSize, void* _ctx)
+{
+    lsdelf_ctx* ctx = NULL;
+    if(!_ctx || !item || itemSize == 0) return -1;
+    ctx = (lsdelf_ctx*)_ctx;
+
+    // Check if symbol type is specified with 'type:symbol'
+    const char* colonPos = memchr(item, ':', itemSize);
+    const char* symName = item;
+    elf_symbol sym = {0};
+
+    if(!colonPos)
+    {
+        // No type specified, treat as any type
+        if(itemSize == 0) return -1;
+        sym.type = -1;
+        sym.name = (char*)malloc(itemSize + 1);
+        if(!sym.name) return -1;
+        memcpy(sym.name, item, itemSize);
+        sym.name[itemSize] = '\0';
+        add_elf_symbol_array_item_move(&ctx->filter_symbols, sym);
+        return 0;
+    }
+
+    symName = colonPos + 1;
+
+    size_t typeSize = colonPos - item;
+    size_t symNameSize = itemSize - typeSize - 1; // -1 for the colon
+    if(typeSize == 0 || symNameSize == 0) return -1; // Invalid format
+
+    // Parse symbol type
+    if((strncmp(item, "function", sizeof("function")-1) == 0 && typeSize == sizeof("function")-1) ||
+        (strncmp(item, "func", sizeof("func")-1) == 0 && typeSize == sizeof("func")-1) ||
+        (item[0] == 'f' && typeSize == 1)){
+        sym.type = STT_FUNC;
+    }else if((strncmp(item, "object", sizeof("object")-1) == 0 && typeSize == sizeof("object")-1) ||
+        (strncmp(item, "obj", sizeof("obj")-1) == 0 && typeSize == sizeof("obj")-1) ||
+        (item[0] == 'o' && typeSize == 1)){
+        sym.type = STT_OBJECT;
+    }else if((strncmp(item, "any", sizeof("any")-1) == 0 && typeSize == sizeof("any")-1) ||
+        (item[0] == 'a' && typeSize == 1)){
+        sym.type = -1; // Special value to indicate any type
+    }else{
+        fprintf(stderr, "Unknown symbol type: '%.*s' in '%.*s'\n", (int)typeSize, item, (int)itemSize, item);
+        return -1;
+    }
+    sym.name = (char*)malloc(symNameSize + 1);
+    if(!sym.name) return -1;
+    memcpy(sym.name, symName, symNameSize);
+    sym.name[symNameSize] = '\0';
+    add_elf_symbol_array_item_move(&ctx->filter_symbols, sym);
+    return 0;
+}
+
 void printUsage(const char* progName)
 {
     fprintf(stderr, "Usage: %s [options] <input paths...>\n", progName);
@@ -377,7 +474,14 @@ void printUsage(const char* progName)
     fprintf(stderr, "                               shared, s,\n");
     fprintf(stderr, "                               core, c,\n");
     fprintf(stderr, "                               all, a\n");
-    fprintf(stderr, "  -s, --strict             Only match the exact type specified (don't treat ET_EXEC as matching ET_DYN and vice versa)\n");
+    fprintf(stderr, "  -s, --symbol <t:?sym>    Filter by symbol (e.g., -sfoo, -s foo, --symbol=foo, --symbol foo)\n");
+    fprintf(stderr, "                           Optionally specify symbol type with 'type:symbol' \n");
+    fprintf(stderr, "                           (e.g., --symbol=func:foo --symbol func:foo)\n");
+    fprintf(stderr, "                           where type can be one of:\n");
+    fprintf(stderr, "                               func, f: function symbol\n");
+    fprintf(stderr, "                               object, obj, o: object symbol\n");
+    fprintf(stderr, "                               any, a: any symbol type\n");
+    fprintf(stderr, "  --strict                 Only match the exact type specified (don't treat ET_EXEC as matching ET_DYN and vice versa)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  -T, --test               Run in test mode. Return 0 if all input paths are valid ELF files\n");
     fprintf(stderr, "                           otherwise return the index of the first file provided that is not a valid ELF file\n");
@@ -388,10 +492,18 @@ void printUsage(const char* progName)
     fprintf(stderr, "                           (one pattern per line, supports wildcards)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  -L, --list               Print in list format\n");
-    fprintf(stderr, "  -P, --full-path          Print full path instead of just filename\n");
+    fprintf(stderr, "  -P, --full-path          Print relative path instead of just filename\n");
+    fprintf(stderr, "  --real-path              Print real path instead of filename\n");
     fprintf(stderr, "  -F, --pretty             Pretty format (only applies with --list)\n");
     fprintf(stderr, "  --no-color               Disable colorized output\n");
     fprintf(stderr, "  -1                       Print only the filename (no path)\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  --show-arch=y|n          Show architecture in output (default: yes)\n");
+    fprintf(stderr, "  --show-type=y|n          Show type in output (default: yes)\n");
+    fprintf(stderr, "  --show-libs=y|n|m        Show linked libraries in output (default: yes)\n");
+    fprintf(stderr, "                           If 'm' is specified, show linked libraries only if they match the filter\n");
+    fprintf(stderr, "  --show-symbols=y|n|m     Show symbols in output (default: no)\n");
+    fprintf(stderr, "                           If 'm' is specified, show symbols only if they match the filter\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  -v, --verbose            Enable verbose output\n");
     fprintf(stderr, "  --config <file>          Use specified config file\n");
@@ -525,13 +637,32 @@ int loadConfig(lsdelf_ctx* ctx, const char* configPath)
             PARSE_BOOL_OR_WARN(value, "pretty", &ctx->prettyFormat);
         }else if(strcmp(property, "full_path") == 0){
             PARSE_BOOL_OR_WARN(value, "full_path", &ctx->printFullPath);
+        }else if(strcmp(property, "real_path") == 0){
+            PARSE_BOOL_OR_WARN(value, "real_path", &ctx->printRealPath);
         }else if(strcmp(property, "colorize") == 0){
             PARSE_BOOL_OR_WARN(value, "colorize", &ctx->colorize);
         } else  if(strcmp(property, "strict") == 0){
             PARSE_BOOL_OR_WARN(value, "strict", &ctx->strictType);
         }else if(strcmp(property, "oneline") == 0){
             PARSE_BOOL_OR_WARN(value, "oneline", &ctx->printOnePerLine);
-        }else if(strcmp(property, "exclude") == 0){
+        }else if(strcmp(property, "show_arch") == 0){
+            PARSE_BOOL_OR_WARN(value, "show_arch", &ctx->showArch);
+        }else if(strcmp(property, "show_type") == 0){
+            PARSE_BOOL_OR_WARN(value, "show_type", &ctx->showType);
+        }else if(strcmp(property, "show_libs") == 0){
+            if(strcmp(value, "m") == 0 || strcmp(value, "match") == 0){
+                ctx->showLibs = 2; // Show libs only if they match the filter
+            }else{
+                PARSE_BOOL_OR_WARN(value, "show_libs", &ctx->showLibs);
+            }
+        }else if(strcmp(property, "show_symbols") == 0){
+            if(strcmp(value, "m") == 0 || strcmp(value, "match") == 0){
+                ctx->showSymbols = 2; // Show symbols only if they match the filter
+            }else{
+                PARSE_BOOL_OR_WARN(value, "show_symbols", &ctx->showSymbols);
+            }
+        }
+        else if(strcmp(property, "exclude") == 0){
             // Support comma-separated list of patterns
             if(0 != parseList(value, ',', add_ignore_pattern, ctx)){
                 fprintf(stderr, "Failed to parse 'exclude' patterns at line %d in config file '%s'\n", lineNum, configPath);
@@ -665,7 +796,20 @@ int parseArgs(lsdelf_ctx* ctx, int argc, char** argv, int canReloadConfig)
                     skipBy=-3; // Empty value
                 }
             }
-        } else if((matchedOpt = matchOption(currentArg, OPTIONS("-F", "--pretty")))){
+        } 
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("-s", "--symbol")))){
+            if((skipBy = extractOptionValue(matchedOpt, currentArg, nextArg, &optValue)) >= 0){
+                if(optValue[0]!='\0'){
+                    if(0 != add_symbol_to_list(optValue, strlen(optValue), ctx)){
+                        return -1;
+                    }
+                }
+                else{
+                    skipBy=-3; // Empty value
+                }
+            }
+        }
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("-F", "--pretty")))){
             if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
                 ctx->prettyFormat = 1;
             }
@@ -689,7 +833,7 @@ int parseArgs(lsdelf_ctx* ctx, int argc, char** argv, int canReloadConfig)
         else if((matchedOpt = matchOption(currentArg, OPTIONS("-d", "--depth")))){
             skipBy = extractOptionIntValue(matchedOpt, currentArg, nextArg, &ctx->depth);
         }
-        else if((matchedOpt = matchOption(currentArg, OPTIONS("-s", "--strict")))){
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("--strict")))){
             if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
                 ctx->strictType = 1;
             }
@@ -709,9 +853,107 @@ int parseArgs(lsdelf_ctx* ctx, int argc, char** argv, int canReloadConfig)
                 ctx->printFullPath = 1;
             }
         }
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("--real-path")))){
+            if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
+                ctx->printRealPath = 1;
+            }
+        }
         else if((matchedOpt = matchOption(currentArg, OPTIONS("-1")))){
             if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
                 ctx->printOnePerLine = 1;
+            }
+        }
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("--show-arch")))){
+            if((skipBy = extractOptionValue(matchedOpt, currentArg, nextArg, &optValue)) >= 0){
+                if(parseBoolValue(optValue, &ctx->showArch) != 0){
+                    if(((optValue == nextArg) && (optValue[0] == '-')) || is_path(optValue)){
+                        // Next argument looks like another option, treat as missing value
+                        skipBy = -2;
+                    }else{
+                        skipBy = -4; // Invalid value
+                    }
+                }
+            }
+            if(skipBy == -2){
+                // If no value provided, default to 1 (enabled)
+                ctx->showArch = 1;
+                skipBy = 0;
+            }
+        }
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("--show-type")))){
+            if((skipBy = extractOptionValue(matchedOpt, currentArg, nextArg, &optValue)) >= 0){
+                if(parseBoolValue(optValue, &ctx->showType) != 0){
+                    if(((optValue == nextArg) && (optValue[0] == '-')) || is_path(optValue)){
+                        // Next argument looks like another option, treat as missing value
+                        skipBy = -2;
+                    }else{
+                        skipBy = -4; // Invalid value
+                    }
+                }
+            }
+            if(skipBy == -2){
+                // If no value provided, default to 1 (enabled)
+                ctx->showType = 1;
+                skipBy = 0;
+            }
+        }
+         else if((matchedOpt = matchOption(currentArg, OPTIONS("--show-libs")))){
+            if((skipBy = extractOptionValue(matchedOpt, currentArg, nextArg, &optValue)) >= 0){
+                if(parseBoolValue(optValue, &ctx->showLibs) != 0){
+                    if(strcmp(optValue, "m") == 0){
+                        ctx->showLibs = 2;
+                    }else{
+                        if(((optValue == nextArg) && (optValue[0] == '-')) || is_path(optValue)){
+                            // Next argument looks like another option, treat as missing value
+                            skipBy = -2;
+                        }else{
+                            skipBy = -4; // Invalid value
+                        }
+                    }
+                }
+            }
+            if(skipBy == -2){
+                // If no value provided, default to 1 (enabled)
+                ctx->showLibs = 1;
+                skipBy = 0;
+            }
+        }
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("--show-symbols")))){
+            if((skipBy = extractOptionValue(matchedOpt, currentArg, nextArg, &optValue)) >= 0){
+                if(parseBoolValue(optValue, &ctx->showSymbols) != 0){
+                    if(strcmp(optValue, "m") == 0){
+                        ctx->showSymbols = 2;
+                    }else{
+                        if(((optValue == nextArg) && (optValue[0] == '-')) || is_path(optValue)){
+                            // Next argument looks like another option, treat as missing value
+                            skipBy = -2;
+                        }else{
+                            skipBy = -4; // Invalid value
+                        }
+                    }
+                }
+            }
+            if(skipBy == -2){
+                // If no value provided, default to 1 (enabled)
+                ctx->showSymbols = 1;
+                skipBy = 0;
+            }
+        } else if((matchedOpt = matchOption(currentArg, OPTIONS("--no-show-arch")))){
+            if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
+                ctx->showArch = 0;
+            }
+        } else if((matchedOpt = matchOption(currentArg, OPTIONS("--no-show-type")))){
+            if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
+                ctx->showType = 0;
+            }
+        }
+        else if((matchedOpt = matchOption(currentArg, OPTIONS("--no-show-libs")))){
+            if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
+                ctx->showLibs = 0;
+            }
+        } else if((matchedOpt = matchOption(currentArg, OPTIONS("--no-show-symbols")))){
+            if((skipBy = extractFlag(matchedOpt, currentArg, nextArg)) == 0){
+                ctx->showSymbols = 0;
             }
         }
         else if((matchedOpt = matchOption(currentArg, OPTIONS("-T", "--test")))){
@@ -792,9 +1034,7 @@ int parseArgs(lsdelf_ctx* ctx, int argc, char** argv, int canReloadConfig)
     if(needsConfigReload && canReloadConfig){
         //We do this at last to check arguments are valid before reloading config and potentially losing them
         lsdelf_ctx_free(ctx);
-        memset(ctx, 0, sizeof(lsdelf_ctx));
-        ctx->depth = 1;// Default depth is 1 (non-recursive)
-        ctx->colorize = 1; // Default colorize is on   
+        lsdelf_ctx_init(ctx);
 
         if(newConfigFile){
             if(0 != loadConfig(ctx, newConfigFile)){
@@ -864,12 +1104,47 @@ int lsdelf_filter_libs(lsdelf_ctx* ctx, elf_ctx* elf)
     return foundLib;
 }
 
+int lsdelf_filter_symbols(lsdelf_ctx* ctx, elf_ctx* elf)
+{
+    if(!ctx) return 0;
+    if(ctx->filter_symbols.count == 0) return 1;
+
+    for(size_t i=0; i<ctx->filter_symbols.count; i++){
+        const char* symPattern = ctx->filter_symbols.items[i].name;
+        int symType = ctx->filter_symbols.items[i].type;
+
+        const Elf64_Sym* symbol = NULL;
+        for(size_t j=0;; j++){
+            symbol = elf_ctx_get_symbol(elf, j);
+            if(!symbol){
+                break;
+            }
+            if(symbol->st_name == 0){
+                continue; // Skip symbols with no name
+            }
+            if(symType >= 0 && ELF64_ST_TYPE(symbol->st_info) != symType){
+                continue; // Symbol type doesn't match
+            }
+
+            const char* currentSymName = elf_ctx_get_symbol_name(elf, symbol);
+            if(!currentSymName){
+                continue;
+            }
+            if(str_wildcard_match(symPattern, currentSymName)){
+                return 1; // Found a matching symbol
+            }
+        }
+    }    
+    return 0;
+}
+
 int lsdelf_filter(lsdelf_ctx* ctx, elf_ctx* elf)
 {
     if(!ctx || !elf) return 0;
     if(!lsdelf_filter_arch(ctx, elf)) return 0;
     if(!lsdelf_filter_type(ctx, elf)) return 0;
     if(!lsdelf_filter_libs(ctx, elf)) return 0;
+    if(!lsdelf_filter_symbols(ctx, elf)) return 0;
     return 1;
 }
 
@@ -937,7 +1212,8 @@ int fts_comparator(const FTSENT**a, const FTSENT**b)
     return strcasecmp(a[0]->fts_name, b[0]->fts_name);
 }
 
-void printf_elf_info(lsdelf_ctx* ctx, elf_ctx* elf, const char* parentDir, int baseNameOnly)
+// Someday I will refactor this function, it's a mess but it works for now
+void print_elf_info(lsdelf_ctx* ctx, elf_ctx* elf, const char* parentDir, int baseNameOnly)
 {
     char fullPath[PATH_MAX+1] = {0};
     const char* filePath = elf->filePath;
@@ -951,7 +1227,14 @@ void printf_elf_info(lsdelf_ctx* ctx, elf_ctx* elf, const char* parentDir, int b
         separator = '\n';
     }
 
-    if(ctx->printFullPath && parentDir && parentDir[0] != '\0'){
+    if(ctx->printRealPath){
+        if(realpath(elf->filePath, fullPath)){
+            filePath = fullPath;
+        }else{
+            // If realpath fails, fall back to original path
+            filePath = elf->filePath;
+        }
+    }else if(ctx->printFullPath && parentDir && parentDir[0] != '\0'){
         if(parentDir[strlen(parentDir)-1] == '/'){
             snprintf(fullPath, sizeof(fullPath), "%s%s", parentDir, get_filename(filePath));
         }else{
@@ -984,66 +1267,257 @@ void printf_elf_info(lsdelf_ctx* ctx, elf_ctx* elf, const char* parentDir, int b
     }
     
     if(!ctx->prettyFormat){
-        printf("%-8s %-8s", type, machine);
-        const Elf64_Dyn* needed = NULL;
-        unsigned int offset = 0;
-        int isFirstLib=1;
-        do{
-            needed = elf_ctx_get_dynamic_section_entry(elf, DT_NEEDED, offset++);
-            if(!needed){    
-                break;
-            }
-            const char* libName = elf_ctx_get_dynamic_entry_str(elf, needed);
-            if(!libName){
-                continue;
-            }
-            if(isFirstLib){
-                printf(" [%s", libName);
-                isFirstLib = 0;
-            }else{
-                printf(", %s", libName);
-            }
-        }while(needed);
-        if(!isFirstLib){
-            printf("]");
-            if(isExec && ctx->colorize){
-                printf("    \033[32;1m%s\033[0m\n", filePath);
-            }else{
-                printf("    %s\n", filePath);
-            }
-        }else{
-            if(isExec && ctx->colorize){
-                printf(" \033[32;1m%s\033[0m\n", filePath);
-            }else{
-                printf(" %s\n", filePath);
-            }
+        int printedLibs = 0;
+        if(ctx->showType == 1){
+            printf("%-8s ", type);
         }
-    }else{
-        if(isExec && ctx->colorize){
-            printf("── \033[32;1m%s\033[0m (%s, %s)\n", filePath, type, machine);
-        }else{
-            printf("── %s (%s, %s)\n", filePath, type, machine);
+        if(ctx->showArch == 1){
+            printf("%-8s ", machine);
         }
-        const Elf64_Dyn* needed = NULL;
-        unsigned int offset = 0;
-        needed = elf_ctx_get_dynamic_section_entry(elf, DT_NEEDED, offset);
-        if(needed){
+        if(ctx->showLibs==1){
+            const Elf64_Dyn* needed = NULL;
+            unsigned int offset = 0;
+            int isFirstLib=1;
             do{
+                needed = elf_ctx_get_dynamic_section_entry(elf, DT_NEEDED, offset++);
+                if(!needed){    
+                    break;
+                }
                 const char* libName = elf_ctx_get_dynamic_entry_str(elf, needed);
                 if(!libName){
                     continue;
                 }
-                offset++;
-                const Elf64_Dyn* nextNeeded = elf_ctx_get_dynamic_section_entry(elf, DT_NEEDED, offset);
-                if(!nextNeeded){
-                     printf("  └─ %s\n", libName);
+                if(isFirstLib){
+                    if(ctx->showType == 1 || ctx->showArch == 1){
+                        printf("  ");
+                    }
+                    printf("[%s", libName);
+                    isFirstLib = 0;
                 }else{
-                    printf("  ├─ %s\n", libName);
+                    printf(", %s", libName);
                 }
-                needed = nextNeeded;
+                printedLibs = 1;
             }while(needed);
+            if(!isFirstLib){
+                printf("]   ");
+            }
+        }else if(ctx->showLibs==2){
+            const char* lastLibName = NULL;
+            for(size_t i=0; i<ctx->filter_libs.count; i++){
+                const char* libPattern = ctx->filter_libs.items[i];
+                const Elf64_Dyn* lib = NULL;
+                for(size_t j=0;; j++){
+                    lib = elf_ctx_get_dynamic_section_entry(elf, DT_NEEDED, j);
+                    if(!lib){
+                        break;
+                    }
+                    const char* libName = elf_ctx_get_dynamic_entry_str(elf, lib);
+                    if(!libName){
+                        continue;
+                    }
+                    if(!str_wildcard_match(libPattern, libName)){
+                        continue; // Library name doesn't match the pattern
+                    }
+
+                    if(!lastLibName){
+                        if(ctx->showType == 1 || ctx->showArch == 1){
+                            printf("  ");
+                        }
+                        printf("[");
+                    }else{
+                        printf("%s, ", lastLibName);
+                    }
+                    lastLibName = libName;
+                }
+            }
+            if(lastLibName){
+                printf("%s]   ", lastLibName);
+                printedLibs = 1;
+            }
         }
-        if(offset > 0){
+        if(printedLibs || ctx->showType == 1 || ctx->showArch == 1){
+            printf(" ");
+        }
+        if(isExec && ctx->colorize){
+            printf("\033[32;1m%s\033[0m\n", filePath);
+        }else{
+            printf("%s\n", filePath);
+        }
+    }else{
+        int printedSub = 0;
+        if(isExec && ctx->colorize){
+            printf("── \033[32;1m%s\033[0m", filePath);
+        }else{
+            printf("── %s", filePath);
+        }
+        if(ctx->showType == 1){
+            printf( " (%s", type);
+        }
+        if(ctx->showArch == 1){
+            if(ctx->showType == 1){
+                printf(", %s)\n", machine);
+            }else{
+                printf(" (%s)\n", machine);
+            }
+        }else{
+            if(ctx->showType == 1){
+                printf(")\n");
+            }else{
+                printf("\n");
+            }
+        }
+
+        if(ctx->showLibs == 1){
+            const char* lastLibName = NULL;
+            const Elf64_Dyn* lib = NULL;
+            for(size_t j=0;; j++){
+                lib = elf_ctx_get_dynamic_section_entry(elf, DT_NEEDED, j);
+                if(!lib){
+                    break;
+                }
+                const char* libName = elf_ctx_get_dynamic_entry_str(elf, lib);
+                if(!libName){
+                    continue;
+                }
+                if(!lastLibName){
+                    // First library, print the header
+                    if(ctx->showSymbols==1 || (ctx->showSymbols==2 && ctx->filter_symbols.count > 0)){
+                        printf(" ├── Libraries:\n");
+                    }else{
+                        printf(" └── Libraries:\n");
+                    }
+                }else{
+                    if(ctx->showSymbols==1 || (ctx->showSymbols==2 && ctx->filter_symbols.count > 0)){
+                        printf(" │  ├─ %s\n", libName);
+                    }else{
+                        printf("    ├─ %s\n", libName);
+                    }
+                }
+                lastLibName = libName;
+            }
+            if(lastLibName){
+                if(ctx->showSymbols==1 || (ctx->showSymbols==2 && ctx->filter_symbols.count > 0)){
+                    printf(" │  └─ %s\n", lastLibName);
+                    printf(" │\n");
+                }else{
+                    printf("    └─ %s\n", lastLibName);
+                    printf("\n");
+                }
+                printedSub =1;
+            }
+        } else if(ctx->showLibs == 2){
+            const char* lastLibName = NULL;
+            for(size_t i=0; i<ctx->filter_libs.count; i++){
+                const char* libPattern = ctx->filter_libs.items[i];
+                const Elf64_Dyn* lib = NULL;
+                for(size_t j=0;; j++){
+                    lib = elf_ctx_get_dynamic_section_entry(elf, DT_NEEDED, j);
+                    if(!lib){
+                        break;
+                    }
+                    const char* libName = elf_ctx_get_dynamic_entry_str(elf, lib);
+                    if(!libName){
+                        continue;
+                    }
+                    if(!str_wildcard_match(libPattern, libName)){
+                        continue; // Library name doesn't match the pattern
+                    }
+
+                    if(!lastLibName){
+                        // First library, print the header
+                        if(ctx->showSymbols==1 || (ctx->showSymbols==2 && ctx->filter_symbols.count > 0)){
+                            printf(" ├── Matched Libraries:\n");
+                        }else{
+                            printf(" └── Matched Libraries:\n");
+                        }
+                    }else{
+                        if(ctx->showSymbols==1 || (ctx->showSymbols==2 && ctx->filter_symbols.count > 0)){
+                            printf(" │  ├─ %s\n", lastLibName);
+                        }else{
+                            printf("    ├─ %s\n", lastLibName);
+                        }
+                    }
+                    lastLibName = libName;
+                }
+            }
+            if(lastLibName){
+                if(ctx->showSymbols==1 || (ctx->showSymbols==2 && ctx->filter_symbols.count > 0)){
+                    printf(" │  └─ %s\n", lastLibName);
+                    printf(" │\n");
+                }else{
+                    printf("    └─ %s\n", lastLibName);
+                    printf("\n");
+                }
+                printedSub =1;
+            }
+        }
+        if(ctx->showSymbols == 1){
+            printf(" └── Symbols:\n");
+            const char* lastSymName = NULL;
+
+            const Elf64_Sym* symbol = NULL;
+            for(size_t j=0;; j++){
+                symbol = elf_ctx_get_symbol(elf, j);
+                if(!symbol){
+                    break;
+                }
+                if(symbol->st_name == 0){
+                    continue; // Skip symbols with no name
+                }
+                const char* symName = elf_ctx_get_symbol_name(elf, symbol);
+                if(!symName){
+                    continue;
+                }
+                if(lastSymName){
+                    printf("    ├─ %s\n", lastSymName);
+                }
+                lastSymName = symName;
+            }
+            if(lastSymName){
+                printf("    └─ %s\n", lastSymName);
+                printf("\n");
+                printedSub = 1;
+            }
+        }else if(ctx->showSymbols == 2 && ctx->filter_symbols.count > 0){
+            printf(" └── Matched Symbols:\n");
+            const char* lastSymName = NULL;
+
+            for(size_t i=0; i<ctx->filter_symbols.count; i++){
+                const char* symPattern = ctx->filter_symbols.items[i].name;
+                int symType = ctx->filter_symbols.items[i].type;
+
+                const Elf64_Sym* symbol = NULL;
+                for(size_t j=0;; j++){
+                    symbol = elf_ctx_get_symbol(elf, j);
+                    if(!symbol){
+                        break;
+                    }
+                    if(symbol->st_name == 0){
+                        continue; // Skip symbols with no name
+                    }
+                    if(symType >= 0 && ELF64_ST_TYPE(symbol->st_info) != symType){
+                        continue; // Symbol type doesn't match
+                    }
+
+                    const char* currentSymName = elf_ctx_get_symbol_name(elf, symbol);
+                    if(!currentSymName){
+                        continue;
+                    }
+                    if(str_wildcard_match(symPattern, currentSymName)){
+                        if(lastSymName){
+                            printf("    ├─ %s\n", lastSymName);
+                        }
+                        lastSymName = currentSymName;
+                    }
+                }
+            }
+            if(lastSymName){
+                printf("    └─ %s\n", lastSymName);
+                printf("\n");
+                printedSub =1;
+            }
+        }
+        if(!printedSub){
             printf("\n");
         }
     }    
@@ -1057,13 +1531,13 @@ void print_elf_info_list(lsdelf_ctx* ctx, const char* dirName, int depth, elf_ct
     }
     
     if(depth > 0 || ctx->input_paths.count > 1 || ctx->recursive){
-        if(!ctx->printOnePerLine || !ctx->printFullPath){
+        if(!ctx->printRealPath && (!ctx->printOnePerLine || !ctx->printFullPath)){
             printf("%s:\n", dirName);
         }
     }
     
     for(size_t i = 0; i < elfs->count; i++){
-        printf_elf_info(ctx, &elfs->items[i], dirName, 1);
+        print_elf_info(ctx, &elfs->items[i], dirName, 1);
     }
     
 }
@@ -1122,7 +1596,7 @@ void lsdelf_process_recursive_dir(lsdelf_ctx* ctx, const char* dirPath)
             if(node->fts_info == FTS_D){
                 if(currentDirNodes > 0){
                     if(ctx->processedPathCount > 0 && (!ctx->testMode)){
-                        if(!ctx->printOnePerLine || !ctx->printFullPath){
+                        if(!ctx->printRealPath && (!ctx->printOnePerLine || !ctx->printFullPath)){
                             printf("\n");
                             if(!ctx->asList && lastLevel > 0)
                             {
@@ -1160,7 +1634,7 @@ void lsdelf_process_recursive_dir(lsdelf_ctx* ctx, const char* dirPath)
 
     if(currentDirNodes > 0){
         if(ctx->processedPathCount > 0 && (!ctx->testMode)){
-            if(!ctx->printOnePerLine || !ctx->printFullPath){
+            if(!ctx->printRealPath && (!ctx->printOnePerLine || !ctx->printFullPath)){
                 printf("\n");
                 if(!ctx->asList && lastLevel > 0)
                 {
@@ -1210,7 +1684,7 @@ int lsdelf_process_path(lsdelf_ctx* ctx, const char* path)
         }
         int lastProcessedCount = ctx->processedPathCount;
         if(lastProcessedCount > 0 && ctx->input_paths.count > 1 && !ctx->asList && (!ctx->testMode)){
-            if(!ctx->printOnePerLine || !ctx->printFullPath){
+            if(!ctx->printRealPath && (!ctx->printOnePerLine || !ctx->printFullPath)){
                 printf("\n");
             }
         }
@@ -1258,7 +1732,7 @@ int lsdelf_process_path(lsdelf_ctx* ctx, const char* path)
         }
 
         elf.filePath = strdup(path);
-        printf_elf_info(ctx, &elf, NULL, 0);
+        print_elf_info(ctx, &elf, NULL, 0);
         elf_ctx_close(&elf);
         ctx->processedPathCount++;
     }
@@ -1279,6 +1753,10 @@ int printConfiguration(lsdelf_ctx* ctx)
     printf("  Colorize: %s\n", ctx->colorize ? "Yes" : "No");
     printf("  Strict Type Matching: %s\n", ctx->strictType ? "Yes" : "No");
     printf("  One Per Line: %s\n", ctx->printOnePerLine ? "Yes" : "No");
+    printf("  Show Architecture: %s\n", ctx->showArch == 1 ? "Yes" : "No");
+    printf("  Show Type: %s\n", ctx->showType == 1 ? "Yes" : "No");
+    printf("  Show Libraries: %s\n", ctx->showLibs == 1 ? "Yes" : (ctx->showLibs == 2 ? "Matched Only" : "No"));
+    printf("  Show Symbols: %s\n", ctx->showSymbols == 1 ? "Yes" : (ctx->showSymbols == 2 ? "Matched Only" : "No"));
 
     if(ctx->filter_archs.count > 0){
         printf("  Filter Architectures: ");
@@ -1337,10 +1815,7 @@ int main(int argc, char* argv[]) {
     int rc = 0;
     int parseArgsResult = 0;
     lsdelf_ctx ctx = {0};
-    memset(&ctx, 0, sizeof(lsdelf_ctx));
-
-    ctx.depth = 1;// Default depth is 1 (non-recursive)
-    ctx.colorize = 1; // Default colorize is on   
+    lsdelf_ctx_init(&ctx);
 
     char configPath[PATH_MAX+1] = {0};
     const char* homeDir = getenv("HOME");
