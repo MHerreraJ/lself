@@ -105,6 +105,7 @@ void lsdelf_ctx_init(lsdelf_ctx* ctx){
     ctx->showArch = 1; // Show architecture by default
     ctx->showType = 1; // Show type by default
     ctx->showLibs = 1; // Show linked libraries by default
+    ctx->showSymbols = 2; //Show only if match filter by default
 }
 
 void lsdelf_ctx_free(lsdelf_ctx* ctx)
@@ -1452,7 +1453,6 @@ void print_elf_info(lsdelf_ctx* ctx, elf_ctx* elf, const char* parentDir, int ba
             }
         }
         if(ctx->showSymbols == 1){
-            printf(" └── Symbols:\n");
             const char* lastSymName = NULL;
 
             const Elf64_Sym* symbol = NULL;
@@ -1470,6 +1470,33 @@ void print_elf_info(lsdelf_ctx* ctx, elf_ctx* elf, const char* parentDir, int ba
                 }
                 if(lastSymName){
                     printf("    ├─ %s\n", lastSymName);
+                }else{
+                    printf(" └── Symbols:\n");
+                }
+                lastSymName = symName;
+            }
+
+            for(size_t j=0;; j++){
+                symbol = elf_ctx_get_dyn_symbol(elf, j);
+                if(!symbol){
+                    break;
+                }
+                if(symbol->st_name == 0){
+                    continue; // Skip symbols with no name
+                }
+                const char* symName = elf_ctx_get_dyn_symbol_name(elf, symbol);
+                if(!symName){
+                    continue;
+                }
+                if(lastSymName){
+                    if(j == 0){
+                        printf("    └─ %s\n", lastSymName);
+                        printf(" └── Dynamic Symbols:\n");
+                    }else{
+                        printf("    ├─ %s\n", lastSymName);
+                    }
+                }else{
+                    printf(" └── Dynamic Symbols:\n");
                 }
                 lastSymName = symName;
             }
@@ -1479,7 +1506,6 @@ void print_elf_info(lsdelf_ctx* ctx, elf_ctx* elf, const char* parentDir, int ba
                 printedSub = 1;
             }
         }else if(ctx->showSymbols == 2 && ctx->filter_symbols.count > 0){
-            printf(" └── Matched Symbols:\n");
             const char* lastSymName = NULL;
 
             for(size_t i=0; i<ctx->filter_symbols.count; i++){
@@ -1506,6 +1532,41 @@ void print_elf_info(lsdelf_ctx* ctx, elf_ctx* elf, const char* parentDir, int ba
                     if(str_wildcard_match(symPattern, currentSymName)){
                         if(lastSymName){
                             printf("    ├─ %s\n", lastSymName);
+                        }else{
+                            printf(" └── Matched Symbols:\n");
+                        }
+                        lastSymName = currentSymName;
+                    }
+                }
+
+                
+
+                for(size_t j=0;; j++){
+                    symbol = elf_ctx_get_dyn_symbol(elf, j);
+                    if(!symbol){
+                        break;
+                    }
+                    if(symbol->st_name == 0){
+                        continue; // Skip symbols with no name
+                    }
+                    if(symType >= 0 && ELF64_ST_TYPE(symbol->st_info) != symType){
+                        continue; // Symbol type doesn't match
+                    }
+
+                    const char* currentSymName = elf_ctx_get_dyn_symbol_name(elf, symbol);
+                    if(!currentSymName){
+                        continue;
+                    }
+                    if(str_wildcard_match(symPattern, currentSymName)){
+                        if(lastSymName){
+                            if(j == 0){
+                                printf("    └─ %s\n", lastSymName);
+                                printf(" └── Dynamic Symbols:\n");
+                            }else{
+                                printf("    ├─ %s\n", lastSymName);
+                            }
+                        }else{
+                            printf(" └── Matched Dynamic Symbols:\n");
                         }
                         lastSymName = currentSymName;
                     }

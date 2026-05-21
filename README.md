@@ -43,7 +43,7 @@ lself [options] <input paths...>
 | `--show-arch=y\|n` | Show architecture in output (default: yes) |
 | `--show-type=y\|n` | Show ELF type in output (default: yes) |
 | `--show-libs=y\|n\|m` | Show linked libraries (default: yes; `m` = only if matching filter) |
-| `--show-symbols=y\|n\|m` | Show symbols (default: no; `m` = only if matching filter) |
+| `--show-symbols=y\|n\|m` | Show symbols (default: m; `m` = only if matching filter) (used only with --pretty and --list) |
 | `-v`, `--verbose` | Enable verbose output |
 | `--config <file>` | Use specified config file |
 | `--no-config` | Don't load `~/.lselfrc` |

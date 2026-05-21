@@ -25,7 +25,7 @@ _%EXECUTABLE%_completion(){
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
     opts_short="-h -l -a -t -s -T -R -d -I -L -P -F -1 -v"
-    opts_long="--help --lib --arch --type --symbol --strict --test --recursive --depth --ignore --list --full-path --real-path --pretty --no-color --show-arch --show-type --show-symbols --show-symbols --no-show-type --no-show-arch --no-show-libs --no-show-symbols --verbose --config --no-config --version"
+    opts_long="--help --lib --arch --type --symbol --strict --test --recursive --depth --ignore --list --full-path --real-path --pretty --no-color --show-arch --show-type --show-symbols --show-libs --no-show-type --no-show-arch --no-show-libs --no-show-symbols --verbose --config --no-config --version"
     if [[ ${prev} == --arch || ${prev} == -a ]]; then
         MACHINES="none m32 sparc i386 x86 m68k m88k intel mcu i860 mips s/370 mips le pa-risc vpp500 sparc32+ i960 powerpc powerpc64 s390x spu v800 fr20 rh32 rce arm arm32 alpha superh sparc v9 tricore arc h8/300 h8/300h h8s h8/500 itanium mips x coldfire 68hc12 mma pcp ncpu ndr1 starcore me16 st100 tinyj x86-64 x86_64 amd64 pdsp pdp-10 pdp-11 fx66 st9+ st7 68hc16 68hc11 68hc08 68hc05 svx st19 vax cris javelin firepath zsp mmix huany prism avr fr30 d10v d30v v850 m32r mn10300 mn10200 picojava openrisc arc compact xtensa videocore tmm gpp ns32k tpc snp1k st200 ip2k max cr f2mc16 msp430 blackfin  aarch64 arm64 riscv"
         COMPREPLY=( $(compgen -W "${MACHINES}" -- ${cur}) )
@@ -35,6 +35,12 @@ _%EXECUTABLE%_completion(){
     if [[ ${prev} == --type || ${prev} == -t ]]; then
         FILE_TYPES="r rel relocatable e exec executable d dyn dynamic s shared c core a all"
         COMPREPLY=( $(compgen -W "${FILE_TYPES}" -- ${cur}) )
+        return 0
+    fi
+
+    if [[ ${prev} == --show-arch= || ${prev} == --show-type= || ${prev} == --show-symbols= || ${prev} == --show-libs= ]]; then
+        SHOW_OPTS="y n m"
+        COMPREPLY=( $(compgen -W "${SHOW_OPTS}" -- ${cur}) )
         return 0
     fi
 

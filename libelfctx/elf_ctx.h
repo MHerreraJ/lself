@@ -44,8 +44,14 @@ typedef struct{
     Elf64_Sym* symbols;
     size_t symbols_count;
 
+    Elf64_Sym* dyn_symbols;
+    size_t dyn_symbols_count;
+
     char* symbol_strtab;
     size_t symbol_strtab_size;
+
+    char* dyn_symbol_strtab;
+    size_t dyn_symbol_strtab_size;
 
     int error;
 } elf_ctx;
@@ -76,7 +82,9 @@ const Elf64_Dyn* elf_ctx_get_dynamic_section_entry(elf_ctx* ctx, Elf64_Sxword ta
 const Elf64_Shdr* elf_ctx_get_section_header(elf_ctx* ctx, Elf64_Word type, unsigned int off);
 // const elf_ctx_strtab* elf_ctx_get_strtab(elf_ctx* ctx, size_t index);
 const Elf64_Sym* elf_ctx_get_symbol(elf_ctx* ctx, size_t index);
+const Elf64_Sym* elf_ctx_get_dyn_symbol(elf_ctx* ctx, size_t index);
 const char* elf_ctx_get_symbol_name(elf_ctx* ctx, const Elf64_Sym* sym);
+const char* elf_ctx_get_dyn_symbol_name(elf_ctx* ctx, const Elf64_Sym* sym);
 
 
 const char* elf_ctx_get_dynamic_section_strtab(elf_ctx* ctx);

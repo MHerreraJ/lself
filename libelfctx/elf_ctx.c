@@ -75,6 +75,31 @@ static void __phdr32_to_phdr64(Elf32_Phdr* phdr32, Elf64_Phdr* phdr64) {
     phdr64->p_align  = (Elf64_Xword)phdr32->p_align;
 }
 
+static void __shdr32_to_shdr64(Elf32_Shdr* shdr32, Elf64_Shdr* shdr64){
+    memset(shdr64, 0, sizeof(Elf64_Shdr));
+    shdr64->sh_name = (Elf64_Word)shdr32->sh_name;
+    shdr64->sh_type = (Elf64_Word)shdr32->sh_type;
+    shdr64->sh_flags = (Elf64_Xword)shdr32->sh_flags;
+    shdr64->sh_addr = (Elf64_Addr)shdr32->sh_addr;
+    shdr64->sh_offset = (Elf64_Off)shdr32->sh_offset;
+    shdr64->sh_size = (Elf64_Xword)shdr32->sh_size;
+    shdr64->sh_link = (Elf64_Word)shdr32->sh_link;
+    shdr64->sh_info = (Elf64_Word)shdr32->sh_info;
+    shdr64->sh_addralign = (Elf64_Xword)shdr32->sh_addralign;
+    shdr64->sh_entsize = (Elf64_Xword)shdr32->sh_entsize;
+}
+
+static void __sym32_to_sym64(Elf32_Sym* sym32, Elf64_Sym* sym64)
+{
+    memset(sym64, 0, sizeof(Elf64_Sym));
+    sym64->st_name = (Elf64_Word)	 sym32->st_name;
+    sym64->st_info = (unsigned char) sym32->st_info;
+    sym64->st_other = (unsigned char)sym32->st_other;
+    sym64->st_shndx = (Elf64_Section)sym32->st_shndx;
+    sym64->st_value = (Elf64_Addr)	 sym32->st_value;		
+    sym64->st_size = (Elf64_Xword)	 sym32->st_size;	
+}
+
 static void __dyn32_to_dyn64(Elf32_Dyn* dyn32, Elf64_Dyn* dyn64) {
     memset(dyn64, 0, sizeof(Elf64_Dyn));
 
@@ -216,6 +241,12 @@ void elf_ctx_close(elf_ctx* ctx) {
         ctx->symbols = NULL;
     }
     ctx->symbols_count = 0;
+
+    if(ctx->dyn_symbols){
+        free(ctx->dyn_symbols);
+        ctx->dyn_symbols = NULL;
+    }
+    ctx->dyn_symbols_count = 0;
 
     if(ctx->symbol_strtab){
         free(ctx->symbol_strtab);
@@ -925,6 +956,7 @@ const Elf64_Shdr* elf_ctx_get_section_header(elf_ctx* ctx, Elf64_Word type, unsi
     }
 
     if(!ctx->shdrs){
+        int is32bit = ctx->ehdr.e_ident[EI_CLASS] == ELFCLASS32;
         if(ctx->ehdr.e_shoff == 0 || ctx->ehdr.e_shnum == 0) return NULL;
         ctx->shdrs = (Elf64_Shdr*)calloc(ctx->ehdr.e_shnum, sizeof(Elf64_Shdr));
         if(!ctx->shdrs) {
@@ -936,10 +968,20 @@ const Elf64_Shdr* elf_ctx_get_section_header(elf_ctx* ctx, Elf64_Word type, unsi
                 ctx->shdrs = NULL;
                 return NULL;
             }
-            if(fread(&ctx->shdrs[i], 1, sizeof(Elf64_Shdr), ctx->file) != sizeof(Elf64_Shdr)) {
-                free(ctx->shdrs);
-                ctx->shdrs = NULL;
-                return NULL;
+            if(is32bit){
+                Elf32_Shdr shdr32;
+                if(fread(&shdr32, 1, sizeof(Elf32_Shdr), ctx->file) != sizeof(Elf32_Shdr)) {
+                    free(ctx->shdrs);
+                    ctx->shdrs = NULL;
+                    return NULL;
+                }
+                __shdr32_to_shdr64(&shdr32, &ctx->shdrs[i]); 
+            }else{
+                if(fread(&ctx->shdrs[i], 1, sizeof(Elf64_Shdr), ctx->file) != sizeof(Elf64_Shdr)) {
+                    free(ctx->shdrs);
+                    ctx->shdrs = NULL;
+                    return NULL;
+                }
             }
         }
     }
@@ -974,6 +1016,7 @@ const Elf64_Sym* elf_ctx_get_symbol(elf_ctx* ctx, size_t index)
             return NULL;
         }
 
+        int is32bit = ctx->ehdr.e_ident[EI_CLASS] == ELFCLASS32;
         size_t symCount = symTableHdr->sh_size / symTableHdr->sh_entsize;
         ctx->symbols = (Elf64_Sym*)calloc(symCount, sizeof(Elf64_Sym));
         
@@ -983,10 +1026,20 @@ const Elf64_Sym* elf_ctx_get_symbol(elf_ctx* ctx, size_t index)
                 ctx->symbols = NULL;
                 return NULL;
             }
-            if(fread(&ctx->symbols[ctx->symbols_count + j], 1, sizeof(Elf64_Sym), ctx->file) != sizeof(Elf64_Sym)) {
-                free(ctx->symbols);
-                ctx->symbols = NULL;
-                return NULL;
+            if(is32bit){
+                Elf32_Sym sym;
+                if(fread(&sym, 1, sizeof(Elf32_Sym), ctx->file) != sizeof(Elf32_Sym)) {
+                    free(ctx->symbols);
+                    ctx->symbols = NULL;
+                    return NULL;
+                }
+                __sym32_to_sym64(&sym, &ctx->symbols[j]);
+            }else{
+                if(fread(&ctx->symbols[j], 1, sizeof(Elf64_Sym), ctx->file) != sizeof(Elf64_Sym)) {
+                    free(ctx->symbols);
+                    ctx->symbols = NULL;
+                    return NULL;
+                }
             }            
         }
         ctx->symbols_count = symCount;
@@ -994,6 +1047,55 @@ const Elf64_Sym* elf_ctx_get_symbol(elf_ctx* ctx, size_t index)
 
     if(index < ctx->symbols_count) {
         return &ctx->symbols[index];
+    }
+    return NULL;
+}
+
+const Elf64_Sym* elf_ctx_get_dyn_symbol(elf_ctx* ctx, size_t index)
+{
+    if(!elf_ctx_ok(ctx)) {
+        return NULL;
+    }
+
+    //DT_SYMTAB
+
+    if(!ctx->dyn_symbols){
+        const Elf64_Shdr* symTableHdr = elf_ctx_get_section_header(ctx, SHT_DYNSYM, 0);
+        if(!symTableHdr) {
+            return NULL;
+        }
+
+        int is32bit = ctx->ehdr.e_ident[EI_CLASS] == ELFCLASS32;
+        size_t symCount = symTableHdr->sh_size / symTableHdr->sh_entsize;
+        ctx->dyn_symbols = (Elf64_Sym*)calloc(symCount, sizeof(Elf64_Sym));
+        
+        for(size_t j = 0; j < symCount; j++){
+            if(fseek(ctx->file, symTableHdr->sh_offset + j * symTableHdr->sh_entsize, SEEK_SET) != 0) {
+                free(ctx->dyn_symbols);
+                ctx->dyn_symbols = NULL;
+                return NULL;
+            }
+            if(is32bit){
+                Elf32_Sym sym;
+                if(fread(&sym, 1, sizeof(Elf32_Sym), ctx->file) != sizeof(Elf32_Sym)) {
+                    free(ctx->symbols);
+                    ctx->symbols = NULL;
+                    return NULL;
+                }
+                __sym32_to_sym64(&sym, &ctx->dyn_symbols[j]);
+            }else{
+                if(fread(&ctx->dyn_symbols[j], 1, sizeof(Elf64_Sym), ctx->file) != sizeof(Elf64_Sym)) {
+                    free(ctx->dyn_symbols);
+                    ctx->dyn_symbols = NULL;
+                    return NULL;
+                }
+            }       
+        }
+        ctx->dyn_symbols_count = symCount;
+    }
+
+    if(index < ctx->dyn_symbols_count) {
+        return &ctx->dyn_symbols[index];
     }
     return NULL;
 }
@@ -1034,6 +1136,46 @@ const char* elf_ctx_get_symbol_name(elf_ctx* ctx, const Elf64_Sym* sym)
 
     if(sym->st_name < ctx->symbol_strtab_size) {
         return &ctx->symbol_strtab[sym->st_name];
+    }
+    return NULL;
+}
+
+const char* elf_ctx_get_dyn_symbol_name(elf_ctx* ctx, const Elf64_Sym* sym)
+{
+    if(!elf_ctx_ok(ctx) || !sym) {
+        return NULL;
+    }
+
+    if(!ctx->dyn_symbol_strtab){
+        const Elf64_Shdr* symTableHdr = elf_ctx_get_section_header(ctx, SHT_DYNSYM, 0);
+        if(!symTableHdr) {
+            return NULL;
+        }
+
+        const Elf64_Shdr* strTabHdr = elf_ctx_get_section_header(ctx, SHT_AT_OFFSET, symTableHdr->sh_link);
+        if(!strTabHdr) {
+            return NULL;
+        }
+
+        if(fseek(ctx->file, strTabHdr->sh_offset, SEEK_SET) != 0) {
+            return NULL;
+        }
+
+        ctx->dyn_symbol_strtab_size = strTabHdr->sh_size;
+        ctx->dyn_symbol_strtab = (char*)malloc(ctx->dyn_symbol_strtab_size);
+        if(!ctx->dyn_symbol_strtab) {
+            return NULL;
+        }
+        if(fread(ctx->dyn_symbol_strtab, 1, ctx->dyn_symbol_strtab_size, ctx->file) != ctx->dyn_symbol_strtab_size) {
+            free(ctx->dyn_symbol_strtab);
+            ctx->dyn_symbol_strtab = NULL;
+            ctx->dyn_symbol_strtab_size = 0;
+            return NULL;
+        }   
+    }
+
+    if(sym->st_name < ctx->dyn_symbol_strtab_size) {
+        return &ctx->dyn_symbol_strtab[sym->st_name];
     }
     return NULL;
 }
